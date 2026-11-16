@@ -1,0 +1,69 @@
+name: Build & Release Lumos Backup
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+
+      - name: Syntax Linting
+        run: |
+          for file in lumos-backup.php includes/*.php restore/*.php; do
+            php -l "$file" || exit 1
+          done
+
+      - name: Extract Version & Package Installable Zip
+        id: package
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG_NAME#v}"
+          ZIP_NAME="lumos-backup-v${VERSION}.zip"
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "zip_name=${ZIP_NAME}" >> $GITHUB_OUTPUT
+
+          # Prepare temporary staging directory with plugin root folder 'lumos-backup'
+          STAGING_DIR="build_staging/lumos-backup"
+          mkdir -p "$STAGING_DIR"
+
+          cp lumos-backup.php "$STAGING_DIR/"
+          cp readme.txt "$STAGING_DIR/"
+          cp README.md "$STAGING_DIR/" 2>/dev/null || true
+          cp CHANGELOG.md "$STAGING_DIR/" 2>/dev/null || true
+          cp -r includes "$STAGING_DIR/"
+          cp -r restore "$STAGING_DIR/"
+
+          # Clean up unwanted OS or temp files inside staging
+          find "$STAGING_DIR" -name ".DS_Store" -delete
+          find "$STAGING_DIR" -name "*.tmp" -delete
+
+          # Build the release zip
+          cd build_staging
+          zip -r "../${ZIP_NAME}" lumos-backup
+          cd ..
+          rm -rf build_staging
+
+          ls -lh "${ZIP_NAME}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Lumos Backup ${{ steps.package.outputs.tag_name }}"
+          draft: false
+          prerelease: false
+          files: "${{ steps.package.outputs.zip_name }}"
+          generate_release_notes: true

@@ -1,0 +1,25 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Build artifacts & local test outputs
+/dist/
+lumos-backup-v*.zip
+*.tmp
+*.log
+
+# Lumos runtime generated files (if run inside local WP)
+backup.lock
+restore-config.json
+restore.log
+recovery.md
+lumos-restore.php
+/drill/
+/archives/
+/tmp-*/
+
+# IDE configs
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
