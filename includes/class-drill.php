@@ -395,7 +395,7 @@ class Lumos_Backup_Drill {
 			}
 
 			global $wpdb;
-			$orig_prefix  = isset( $wpdb->prefix ) ? $wpdb->prefix : 'wp_';
+			$orig_prefix  = ! empty( $wpdb->base_prefix ) ? $wpdb->base_prefix : ( isset( $wpdb->prefix ) ? $wpdb->prefix : 'wp_' );
 			$drill_prefix = 'lumos_drill_';
 			$created_tables = [];
 
@@ -545,7 +545,9 @@ class Lumos_Backup_Drill {
 							$sql = self::replace_table_prefix_in_sql( $sql, $orig_prefix, $drill_prefix, $created_tables );
 						}
 
-						if ( ! @$mysqli->query( $sql ) ) {
+						if ( null === $sql ) {
+							// Statement would touch a non-drill table in the live database: skip it.
+						} elseif ( ! @$mysqli->query( $sql ) ) {
 							$error_count++;
 							if ( count( $errors ) < 5 ) {
 								$errors[] = $mysqli->error . ' [SQL: ' . substr( $sql, 0, 80 ) . '...]';
@@ -569,7 +571,9 @@ class Lumos_Backup_Drill {
 			if ( $replace_prefix ) {
 				$sql = self::replace_table_prefix_in_sql( $sql, $orig_prefix, $drill_prefix, $created_tables );
 			}
-			if ( ! @$mysqli->query( $sql ) ) {
+			if ( null === $sql ) {
+				// Skipped: not a drill table.
+			} elseif ( ! @$mysqli->query( $sql ) ) {
 				$error_count++;
 				if ( count( $errors ) < 5 ) {
 					$errors[] = $mysqli->error;
@@ -606,8 +610,36 @@ class Lumos_Backup_Drill {
 		// Replace backtick quoted table names: `wp_users` -> `lumos_drill_users`
 		$pattern = '/`' . preg_quote( $orig_prefix, '/' ) . '([a-zA-Z0-9_]+)`/';
 		$replaced = preg_replace( $pattern, '`' . $drill_prefix . '$1`', $sql );
+		$replaced = $replaced ?: $sql;
 
-		return $replaced ?: $sql;
+		// Safety guard: this SQL runs against the LIVE database, so only allow statements
+		// whose target table is a drill table. Anything else is skipped (returns null).
+		return self::is_safe_drill_statement( $replaced, $drill_prefix ) ? $replaced : null;
+	}
+
+	/**
+	 * Decide whether a rewritten drill statement may run against the live database.
+	 *
+	 * Allows session statements (SET, UNLOCK TABLES) and table statements whose target
+	 * table starts with the drill prefix. Everything else is rejected.
+	 *
+	 * @param string $sql          Rewritten SQL statement.
+	 * @param string $drill_prefix Drill table prefix.
+	 * @return bool
+	 */
+	public static function is_safe_drill_statement( $sql, $drill_prefix ) {
+		$sql = ltrim( $sql );
+
+		if ( preg_match( '/^(SET\s|UNLOCK\s+TABLES)/i', $sql ) ) {
+			return true;
+		}
+
+		$table_stmt = '/^(?:DROP\s+TABLE(?:\s+IF\s+EXISTS)?|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+(?:IGNORE\s+)?INTO|REPLACE\s+INTO|LOCK\s+TABLES|ALTER\s+TABLE|TRUNCATE(?:\s+TABLE)?)\s+`?([^`\s(,;]+)`?/i';
+		if ( ! preg_match( $table_stmt, $sql, $m ) ) {
+			return false;
+		}
+
+		return 0 === strpos( $m[1], $drill_prefix );
 	}
 
 	/**
@@ -622,24 +654,54 @@ class Lumos_Backup_Drill {
 	 */
 	private static function decrypt_archive_file( $enc_path, $dest_path, $passphrase, $kdf_salt, $iterations = 100000 ) {
 		$key = hash_pbkdf2( 'sha256', $passphrase, hex2bin( $kdf_salt ), $iterations, 32, true );
-		$raw = @file_get_contents( $enc_path );
-		if ( false === $raw || strlen( $raw ) < 17 ) {
+
+		// Stream-decrypt in 1 MB chunks so large archives do not exhaust memory.
+		$in = @fopen( $enc_path, 'rb' );
+		if ( ! $in ) {
+			return false;
+		}
+		$iv = (string) fread( $in, 16 );
+		if ( 16 !== strlen( $iv ) ) {
+			fclose( $in );
+			return false;
+		}
+		$out = @fopen( $dest_path, 'wb' );
+		if ( ! $out ) {
+			fclose( $in );
 			return false;
 		}
 
-		$iv         = substr( $raw, 0, 16 );
-		$ciphertext = substr( $raw, 16 );
-		$plaintext  = openssl_decrypt( $ciphertext, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv );
-		unset( $ciphertext, $raw );
-
-		if ( false === $plaintext ) {
-			return false;
+		$ok    = true;
+		$chunk = 1048576;
+		$cur   = (string) fread( $in, $chunk );
+		if ( '' === $cur ) {
+			$ok = false;
 		}
 
-		$written = @file_put_contents( $dest_path, $plaintext );
-		unset( $plaintext );
+		while ( $ok ) {
+			$next    = feof( $in ) ? '' : (string) fread( $in, $chunk );
+			$is_last = ( '' === $next );
+			$flags   = $is_last ? OPENSSL_RAW_DATA : ( OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING );
+			$pt      = openssl_decrypt( $cur, 'aes-256-cbc', $key, $flags, $iv );
 
-		return false !== $written;
+			if ( false === $pt || false === fwrite( $out, $pt ) ) {
+				$ok = false;
+				break;
+			}
+			if ( $is_last ) {
+				break;
+			}
+			$iv  = substr( $cur, -16 );
+			$cur = $next;
+		}
+
+		fclose( $in );
+		fclose( $out );
+		if ( ! $ok ) {
+			@unlink( $dest_path );
+		}
+
+		return $ok;
 	}
 
 	/**

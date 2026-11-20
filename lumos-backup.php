@@ -3,7 +3,7 @@
  * Plugin Name:       Lumos Backup
  * Plugin URI:        https://example.com/lumos-backup
  * Description:       Emergency-resilient WordPress backups with an independent standalone restore page that runs even when WordPress will not boot.
- * Version:           1.1.0
+ * Version:           1.1.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Lumos Backup Team
@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'LUMOS_BACKUP_VERSION', '1.1.0' );
+define( 'LUMOS_BACKUP_VERSION', '1.1.1' );
 define( 'LUMOS_BACKUP_FILE', __FILE__ );
 define( 'LUMOS_BACKUP_PATH', plugin_dir_path( __FILE__ ) );
 define( 'LUMOS_BACKUP_URL', plugin_dir_url( __FILE__ ) );

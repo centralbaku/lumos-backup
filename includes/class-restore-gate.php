@@ -220,10 +220,16 @@ class Lumos_Backup_Restore_Gate {
 		$json_data   = json_encode( $config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
 		$config_path = Lumos_Backup_Storage::get_config_path();
 
-		$written = @file_put_contents( $config_path, $json_data );
+		$written = @file_put_contents( $config_path, Lumos_Backup_Storage::CONFIG_GUARD . $json_data, LOCK_EX );
 		if ( false !== $written ) {
 			// Mode 0600 as required: read/write by owner only
 			@chmod( $config_path, 0600 );
+
+			// Remove the old plain-JSON config, which Nginx would serve publicly.
+			$legacy = Lumos_Backup_Storage::get_legacy_config_path();
+			if ( file_exists( $legacy ) ) {
+				@unlink( $legacy );
+			}
 			return true;
 		}
 

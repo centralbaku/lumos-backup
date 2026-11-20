@@ -117,6 +117,20 @@ class Lumos_Backup_Database {
 			}
 		}
 
+		// Only back up this WordPress install's own tables. Other applications sharing the
+		// database must never be dumped, because a restore or drill would overwrite them.
+		$prefix = ! empty( $wpdb->base_prefix ) ? $wpdb->base_prefix : $wpdb->prefix;
+		if ( '' !== (string) $prefix ) {
+			$tables = array_values(
+				array_filter(
+					$tables,
+					function ( $table ) use ( $prefix ) {
+						return 0 === strpos( (string) $table, $prefix );
+					}
+				)
+			);
+		}
+
 		return $tables;
 	}
 

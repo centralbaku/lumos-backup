@@ -30,6 +30,7 @@ class Lumos_Backup_Scheduler {
 	public function init() {
 		add_filter( 'cron_schedules', [ $this, 'add_cron_schedules' ] );
 		add_action( self::CRON_HOOK, [ $this, 'run_daily_backup' ] );
+		add_action( self::CRON_HOOK . '_once', [ $this, 'run_daily_backup' ] );
 		add_action( self::DRILL_CRON_HOOK, [ $this, 'run_scheduled_drill' ] );
 		add_action( 'lumos_backup_drill_failed', [ $this, 'on_drill_failed' ], 10, 1 );
 		add_action( 'upgrader_process_complete', [ $this, 'on_upgrader_process_complete' ], 10, 2 );
@@ -80,12 +81,15 @@ class Lumos_Backup_Scheduler {
 			wp_unschedule_event( $timestamp, self::CRON_HOOK );
 		}
 		wp_clear_scheduled_hook( self::CRON_HOOK );
+		wp_clear_scheduled_hook( self::CRON_HOOK . '_once' );
 	}
 
 	/**
 	 * Execute the scheduled daily backup task.
 	 */
 	public function run_daily_backup() {
+		// Keep running even if the triggering HTTP connection closes.
+		@ignore_user_abort( true );
 		$archiver = new Lumos_Backup_Archiver();
 		$archiver->create_backup();
 	}
@@ -120,8 +124,11 @@ class Lumos_Backup_Scheduler {
 			}
 		}
 
-		$archiver = new Lumos_Backup_Archiver();
-		$archiver->create_backup();
+		// Do not run the backup inside the update request itself (that request belongs to
+		// the admin and may time out or exhaust memory). Queue a one-off background event.
+		if ( ! wp_next_scheduled( self::CRON_HOOK . '_once' ) ) {
+			wp_schedule_single_event( time() + 60, self::CRON_HOOK . '_once' );
+		}
 	}
 
 	/**

@@ -54,7 +54,8 @@ class Lumos_Backup_Archiver {
 		@file_put_contents( $lock_file, json_encode( [ 'pid' => getmypid(), 'time' => time() ] ) );
 
 		try {
-			$base_filename = sprintf( 'backup-%s.zip', gmdate( 'Ymd-His' ) );
+			// Random suffix makes archive URLs unguessable even where .htaccess is ignored (Nginx).
+			$base_filename = sprintf( 'backup-%s-%s.zip', gmdate( 'Ymd-His' ), bin2hex( random_bytes( 8 ) ) );
 			$archives_dir  = Lumos_Backup_Storage::get_archives_dir();
 			$raw_zip_path  = $archives_dir . '/' . $base_filename;
 			$temp_zip_path = $raw_zip_path . '.tmp';
@@ -136,6 +137,7 @@ class Lumos_Backup_Archiver {
 			}
 
 			// 6. Compute sha256 checksum and write sidecar file (.sha256)
+			@chmod( $final_archive_path, 0600 );
 			$sha256 = hash_file( 'sha256', $final_archive_path );
 			$sidecar_path = $final_archive_path . '.sha256';
 			file_put_contents( $sidecar_path, $sha256 );
@@ -247,22 +249,45 @@ class Lumos_Backup_Archiver {
 		$key = hash_pbkdf2( 'sha256', $passphrase, hex2bin( $kdf_salt ), $iterations, 32, true );
 		$iv  = random_bytes( 16 );
 
-		$plaintext = file_get_contents( $source_path );
-		if ( false === $plaintext ) {
+		// Stream in 1 MB chunks so memory use stays flat regardless of archive size.
+		// Output is byte-identical to one-shot AES-256-CBC with PKCS#7 padding.
+		$in  = @fopen( $source_path, 'rb' );
+		$out = @fopen( $dest_path, 'wb' );
+		if ( ! $in || ! $out ) {
+			if ( $in ) {
+				fclose( $in );
+			}
+			if ( $out ) {
+				fclose( $out );
+			}
 			return false;
 		}
 
-		$ciphertext = openssl_encrypt( $plaintext, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv );
-		unset( $plaintext );
+		$ok    = false !== fwrite( $out, $iv );
+		$chunk = 1048576; // Multiple of the 16-byte block size.
+		$cur   = (string) fread( $in, $chunk );
 
-		if ( false === $ciphertext ) {
-			return false;
+		while ( $ok ) {
+			$next    = feof( $in ) ? '' : (string) fread( $in, $chunk );
+			$is_last = ( '' === $next );
+			$flags   = $is_last ? OPENSSL_RAW_DATA : ( OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING );
+			$ct      = openssl_encrypt( $cur, 'aes-256-cbc', $key, $flags, $iv );
+
+			if ( false === $ct || false === fwrite( $out, $ct ) ) {
+				$ok = false;
+				break;
+			}
+			if ( $is_last ) {
+				break;
+			}
+			$iv  = substr( $ct, -16 );
+			$cur = $next;
 		}
 
-		$written = file_put_contents( $dest_path, $iv . $ciphertext );
-		unset( $ciphertext );
+		fclose( $in );
+		fclose( $out );
 
-		return false !== $written;
+		return $ok;
 	}
 
 	/**
