@@ -34,6 +34,7 @@ new Lumos_GitHub_Updater( __FILE__, 'centralbaku/lumos-backup', LUMOS_BACKUP_VER
 
 // Load class files
 require_once LUMOS_BACKUP_PATH . 'includes/class-storage.php';
+require_once LUMOS_BACKUP_PATH . 'includes/class-progress.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-database.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-s3.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-sftp.php';

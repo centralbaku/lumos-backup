@@ -44,7 +44,7 @@ class Lumos_Backup_CLI {
 		}
 
 		$archiver = new Lumos_Backup_Archiver();
-		$result   = $archiver->create_backup();
+		$result   = $archiver->create_backup( 'cli' );
 
 		if ( is_wp_error( $result ) ) {
 			WP_CLI::error( sprintf( 'Backup failed: %s', $result->get_error_message() ) );

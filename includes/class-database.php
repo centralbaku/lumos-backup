@@ -29,10 +29,11 @@ class Lumos_Backup_Database {
 	 *
 	 * Writes data in batches directly to disk to minimize memory usage.
 	 *
-	 * @param string $output_file Path to destination .sql file.
+	 * @param string        $output_file Path to destination .sql file.
+	 * @param callable|null $progress    Called as ( float $fraction 0-1, string $detail ).
 	 * @return bool|WP_Error True on success, WP_Error on failure.
 	 */
-	public function dump_to_file( $output_file ) {
+	public function dump_to_file( $output_file, $progress = null ) {
 		global $wpdb;
 
 		$handle = @fopen( $output_file, 'wb' );
@@ -71,8 +72,40 @@ class Lumos_Backup_Database {
 		}
 
 		// 3. Process each table
-		foreach ( $tables as $table ) {
-			$this->dump_table( $table, $handle );
+		$table_count = count( $tables );
+		foreach ( $tables as $index => $table ) {
+			$report = null;
+			if ( is_callable( $progress ) ) {
+				$report = function ( $done, $total ) use ( $progress, $index, $table_count, $table ) {
+					$within = $total > 0 ? $done / $total : 1;
+					call_user_func(
+						$progress,
+						( $index + $within ) / $table_count,
+						sprintf(
+							/* translators: 1: table name, 2: table number, 3: table count, 4: rows done, 5: rows total */
+							__( '%1$s (table %2$d of %3$d, %4$s of %5$s rows)', 'lumos-backup' ),
+							$table,
+							$index + 1,
+							$table_count,
+							number_format_i18n( $done ),
+							number_format_i18n( $total )
+						)
+					);
+				};
+				// Heartbeat at the start of each table, including empty ones.
+				call_user_func(
+					$progress,
+					$index / $table_count,
+					sprintf(
+						/* translators: 1: table name, 2: table number, 3: table count */
+						__( '%1$s (table %2$d of %3$d)', 'lumos-backup' ),
+						$table,
+						$index + 1,
+						$table_count
+					)
+				);
+			}
+			$this->dump_table( $table, $handle, $report );
 		}
 
 		// 4. Write footer
@@ -140,7 +173,7 @@ class Lumos_Backup_Database {
 	 * @param string   $table  Table name.
 	 * @param resource $handle Open file handle.
 	 */
-	private function dump_table( $table, $handle ) {
+	private function dump_table( $table, $handle, $report = null ) {
 		global $wpdb;
 
 		$output_n = defined( 'ARRAY_N' ) ? ARRAY_N : 'ARRAY_N';
@@ -187,6 +220,10 @@ class Lumos_Backup_Database {
 			$this->write_insert_statements( $table, $rows, $handle );
 
 			$offset += count( $rows );
+
+			if ( $report ) {
+				call_user_func( $report, min( $offset, $total_rows ), $total_rows );
+			}
 
 			// Free memory
 			unset( $rows );

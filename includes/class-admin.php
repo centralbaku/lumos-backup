@@ -28,6 +28,9 @@ class Lumos_Backup_Admin {
 			add_action( 'network_admin_menu', [ $this, 'register_network_menu' ] );
 		}
 		add_action( 'admin_init', [ $this, 'handle_actions' ] );
+		add_action( 'wp_ajax_lumos_backup_start', [ $this, 'ajax_start_backup' ] );
+		add_action( 'wp_ajax_lumos_backup_progress', [ $this, 'ajax_backup_progress' ] );
+		add_action( 'wp_ajax_lumos_backup_clear_stuck', [ $this, 'ajax_clear_stuck' ] );
 		add_action( 'admin_notices', [ $this, 'display_notices' ] );
 		if ( is_multisite() ) {
 			add_action( 'network_admin_notices', [ $this, 'display_notices' ] );
@@ -302,6 +305,320 @@ class Lumos_Backup_Admin {
 	}
 
 	/**
+	 * AJAX: start a backup and return right away where the server allows it.
+	 *
+	 * The page follows the run through ajax_backup_progress(), so the browser never has
+	 * to wait on (or time out on) the long backup request itself.
+	 */
+	public function ajax_start_backup() {
+		check_ajax_referer( 'lumos_backup_now' );
+		if ( ! current_user_can( self::get_capability() ) ) {
+			wp_send_json_error( [ 'message' => __( 'You are not allowed to run backups.', 'lumos-backup' ) ], 403 );
+		}
+
+		$current = Lumos_Backup_Progress::read();
+		if ( ! empty( $current ) && 'running' === $current['status'] && empty( $current['stalled'] ) ) {
+			wp_send_json_error(
+				[
+					'message'  => __( 'A backup is already running.', 'lumos-backup' ),
+					'progress' => $current,
+				],
+				409
+			);
+		}
+
+		@ignore_user_abort( true );
+		@set_time_limit( 0 );
+
+		// Send the reply now and keep working in the background (PHP-FPM / LiteSpeed).
+		$finish = function_exists( 'fastcgi_finish_request' ) ? 'fastcgi_finish_request' : ( function_exists( 'litespeed_finish_request' ) ? 'litespeed_finish_request' : '' );
+		if ( $finish ) {
+			if ( ! headers_sent() ) {
+				header( 'Content-Type: application/json; charset=' . get_option( 'blog_charset' ) );
+			}
+			echo wp_json_encode( [ 'success' => true, 'data' => [ 'background' => true ] ] );
+			call_user_func( $finish );
+
+			( new Lumos_Backup_Archiver() )->create_backup( 'manual' );
+			exit;
+		}
+
+		// Otherwise the request stays open until the backup ends; the page still polls.
+		$result = ( new Lumos_Backup_Archiver() )->create_backup( 'manual' );
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error( [ 'message' => $result->get_error_message() ] );
+		}
+		wp_send_json_success( [ 'background' => false ] );
+	}
+
+	/**
+	 * AJAX: current backup progress.
+	 */
+	public function ajax_backup_progress() {
+		check_ajax_referer( 'lumos_backup_progress' );
+		if ( ! current_user_can( self::get_capability() ) ) {
+			wp_send_json_error( [], 403 );
+		}
+		wp_send_json_success( Lumos_Backup_Progress::read() );
+	}
+
+	/**
+	 * AJAX: clear a run that stopped responding so a new backup can start.
+	 */
+	public function ajax_clear_stuck() {
+		check_ajax_referer( 'lumos_backup_progress' );
+		if ( ! current_user_can( self::get_capability() ) ) {
+			wp_send_json_error( [], 403 );
+		}
+		if ( ! Lumos_Backup_Progress::clear_stuck() ) {
+			wp_send_json_error( [ 'message' => __( 'The backup is still responding, so it was not cleared.', 'lumos-backup' ) ] );
+		}
+		wp_send_json_success( Lumos_Backup_Progress::read() );
+	}
+
+	/**
+	 * Progress panel shown under the Backup Now button, plus the script that drives it.
+	 */
+	private function render_progress_panel() {
+		$config = [
+			'ajaxUrl'       => admin_url( 'admin-ajax.php' ),
+			'startNonce'    => wp_create_nonce( 'lumos_backup_now' ),
+			'progressNonce' => wp_create_nonce( 'lumos_backup_progress' ),
+			'doneUrl'       => add_query_arg( 'lumos_msg', 'backup_success', self::get_page_url() ),
+			'initial'       => Lumos_Backup_Progress::read(),
+			'i18n'          => [
+				'starting'   => __( 'Starting backup…', 'lumos-backup' ),
+				'elapsed'    => __( 'Elapsed', 'lumos-backup' ),
+				/* translators: %s: duration */
+				'left'       => __( 'About %s left', 'lumos-backup' ),
+				'estimating' => __( 'Estimating time left…', 'lumos-backup' ),
+				/* translators: %s: duration */
+				'lastUpdate' => __( 'Last update %s ago', 'lumos-backup' ),
+				/* translators: %s: duration */
+				'slow'       => __( 'No update for %s. Large files can take a while; still waiting…', 'lumos-backup' ),
+				/* translators: %s: duration */
+				'stuck'      => __( 'No progress for %s. The backup has probably stopped (often the server ran out of memory or time).', 'lumos-backup' ),
+				'clear'      => __( 'Clear stuck backup', 'lumos-backup' ),
+				'cleared'    => __( 'Stuck backup cleared. You can start a new one.', 'lumos-backup' ),
+				/* translators: %s: duration */
+				'done'       => __( 'Backup complete in %s.', 'lumos-backup' ),
+				'reloading'  => __( 'Refreshing the list…', 'lumos-backup' ),
+				'failed'     => __( 'Backup failed', 'lumos-backup' ),
+				'notStarted' => __( 'The backup did not start. Reload the page and try again.', 'lumos-backup' ),
+				'connection' => __( 'Lost contact with the server, retrying…', 'lumos-backup' ),
+				'schedule'   => __( 'Scheduled backup', 'lumos-backup' ),
+				'already'    => __( 'A backup is already running. Showing its progress.', 'lumos-backup' ),
+			],
+		];
+		?>
+		<div id="lumos-progress" class="lumos-progress" hidden aria-live="polite">
+			<div class="lumos-progress__head">
+				<span class="lumos-progress__spinner" aria-hidden="true"></span>
+				<strong class="lumos-progress__label"></strong>
+				<span class="lumos-progress__pct"></span>
+			</div>
+			<div class="lumos-progress__track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+				<div class="lumos-progress__bar"></div>
+			</div>
+			<div class="lumos-progress__detail"></div>
+			<div class="lumos-progress__meta"></div>
+			<div class="lumos-progress__alert" hidden></div>
+			<button type="button" class="button lumos-progress__clear" hidden></button>
+		</div>
+		<style>
+			.lumos-progress { margin-top: 16px; padding: 14px 16px; border: 1px solid #dcdcde; border-radius: 8px; background: #f6f7f7; }
+			.lumos-progress[hidden] { display: none; }
+			.lumos-progress__head { display: flex; align-items: center; gap: 8px; }
+			.lumos-progress__label { flex: 1; font-size: 14px; }
+			.lumos-progress__pct { font-variant-numeric: tabular-nums; font-weight: 600; }
+			.lumos-progress__spinner { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid #c3c4c7; border-top-color: var(--wp-admin-theme-color, #2271b1); animation: lumos-spin .8s linear infinite; }
+			.lumos-progress.is-done .lumos-progress__spinner, .lumos-progress.is-error .lumos-progress__spinner, .lumos-progress.is-stuck .lumos-progress__spinner { display: none; }
+			.lumos-progress__track { height: 10px; margin: 10px 0 8px; border-radius: 5px; background: #dcdcde; overflow: hidden; }
+			.lumos-progress__bar { height: 100%; width: 0; border-radius: 5px; background-color: var(--wp-admin-theme-color, #2271b1); background-image: linear-gradient(45deg, rgba(255,255,255,.2) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.2) 50%, rgba(255,255,255,.2) 75%, transparent 75%); background-size: 20px 20px; transition: width .6s ease; animation: lumos-stripes 1s linear infinite; }
+			.lumos-progress.is-done .lumos-progress__bar { background-color: #00a32a; background-image: none; }
+			.lumos-progress.is-error .lumos-progress__bar, .lumos-progress.is-stuck .lumos-progress__bar { background-color: #d63638; background-image: none; }
+			.lumos-progress.is-slow .lumos-progress__bar { background-color: #dba617; }
+			.lumos-progress__detail { font-size: 13px; color: #3c434a; min-height: 1.4em; overflow-wrap: anywhere; }
+			.lumos-progress__meta { font-size: 12px; color: #646970; margin-top: 4px; font-variant-numeric: tabular-nums; }
+			.lumos-progress__alert { margin-top: 10px; padding: 8px 10px; border-radius: 4px; font-size: 13px; background: #fcf9e8; border-left: 4px solid #dba617; }
+			.lumos-progress__alert[hidden], .lumos-progress__clear[hidden] { display: none; }
+			.lumos-progress.is-stuck .lumos-progress__alert, .lumos-progress.is-error .lumos-progress__alert { background: #fcf0f1; border-left-color: #d63638; }
+			.lumos-progress.is-done .lumos-progress__alert { background: #edfaef; border-left-color: #00a32a; }
+			.lumos-progress__clear { margin-top: 10px !important; }
+			@keyframes lumos-spin { to { transform: rotate(360deg); } }
+			@keyframes lumos-stripes { to { background-position: 20px 0; } }
+			@media (prefers-reduced-motion: reduce) { .lumos-progress__bar, .lumos-progress__spinner { animation: none; } }
+		</style>
+		<script>
+		(function () {
+			var cfg = <?php echo wp_json_encode( $config ); ?>;
+			var t = cfg.i18n;
+			var panel = document.getElementById('lumos-progress');
+			var form = document.getElementById('lumos-backup-now-form');
+			var buttons = [document.getElementById('lumos-backup-now-btn'), document.getElementById('lumos-drill-btn')];
+			if (!panel || !form || !window.fetch) { return; }
+
+			var el = function (c) { return panel.querySelector('.lumos-progress__' + c); };
+			var state = null, clockSkew = 0, pollTimer = null, clockTimer = null, waitingFor = null, waitStarted = 0, failures = 0, note = '';
+
+			function fmt(sec) {
+				sec = Math.max(0, Math.round(sec));
+				if (sec < 60) { return sec + 's'; }
+				var m = Math.floor(sec / 60), s = sec % 60;
+				if (m < 60) { return m + 'm ' + (s < 10 ? '0' : '') + s + 's'; }
+				return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+			}
+			function sprintf(str, v) { return str.replace('%s', v); }
+			function setBusy(busy) { buttons.forEach(function (b) { if (b) { b.disabled = busy; } }); }
+			function post(action, nonce) {
+				var body = new URLSearchParams({ action: action, _ajax_nonce: nonce });
+				return fetch(cfg.ajaxUrl, { method: 'POST', credentials: 'same-origin', body: body })
+					.then(function (r) { return r.json(); });
+			}
+
+			function render() {
+				if (!state) { return; }
+				var now = Date.now() / 1000 + clockSkew;
+				var running = state.status === 'running';
+				var elapsed = running ? now - state.started : (state.elapsed || 0);
+				var silent = running ? now - state.updated : 0;
+				var stallAfter = state.stall_after || 120;
+				var stuck = running && silent > stallAfter;
+				var slow = running && !stuck && silent > Math.min(45, stallAfter / 2);
+				var pct = Math.floor(state.percent || 0);
+
+				panel.hidden = false;
+				panel.className = 'lumos-progress' + (state.status === 'success' ? ' is-done' : '') + (state.status === 'error' ? ' is-error' : '') + (stuck ? ' is-stuck' : '') + (slow ? ' is-slow' : '');
+
+				var label = state.label || t.starting;
+				if (running && state.trigger && state.trigger !== 'manual') { label = t.schedule + ': ' + label; }
+				el('label').textContent = state.status === 'error' ? t.failed : label;
+				el('pct').textContent = pct + '%';
+				el('bar').style.width = Math.max(2, pct) + '%';
+				el('track').setAttribute('aria-valuenow', pct);
+				el('detail').textContent = state.status === 'success'
+					? (state.filename || '') + (state.size_formatted ? ' · ' + state.size_formatted : '')
+					: (state.detail || '');
+
+				var meta = [t.elapsed + ' ' + fmt(elapsed)];
+				if (running && !stuck) {
+					if (state.percent >= 3 && elapsed >= 8) {
+						// Time left from the average speed so far, recomputed every second.
+						meta.push(sprintf(t.left, fmt(Math.max(5, elapsed * (100 - state.percent) / state.percent))));
+					} else {
+						meta.push(t.estimating);
+					}
+				}
+				if (running && state.run_id) { meta.push(sprintf(t.lastUpdate, fmt(silent))); }
+				el('meta').textContent = meta.join(' · ');
+
+				var alert = el('alert'), clear = el('clear'), text = '';
+				clear.hidden = true;
+				if (stuck) {
+					text = sprintf(t.stuck, fmt(silent));
+					clear.hidden = false; clear.textContent = t.clear;
+				} else if (slow) {
+					text = sprintf(t.slow, fmt(silent));
+				} else if (state.status === 'error') {
+					text = state.message || t.failed;
+				} else if (state.status === 'success') {
+					text = sprintf(t.done, fmt(state.elapsed)) + ' ' + t.reloading;
+				} else if (note) {
+					text = note;
+				}
+				alert.hidden = !text;
+				alert.textContent = text;
+				setBusy(running); // stays disabled while stuck: the stuck run still holds the lock until cleared
+			}
+
+			function stop() {
+				clearInterval(pollTimer); clearInterval(clockTimer);
+				pollTimer = clockTimer = null;
+			}
+
+			function apply(data) {
+				if (!data || !data.run_id) { return; }
+				if (waitingFor !== null && data.run_id === waitingFor) {
+					// Still the previous run: the new one has not written its first update yet.
+					if (Date.now() - waitStarted > 20000) {
+						state = { status: 'error', message: t.notStarted, percent: 0, elapsed: 0 };
+						render(); stop();
+					}
+					return;
+				}
+				var wasRunning = state && state.status === 'running';
+				waitingFor = null;
+				state = data;
+				clockSkew = data.now - Date.now() / 1000;
+				render();
+				if (data.status !== 'running') {
+					stop();
+					if (data.status === 'success' && wasRunning) {
+						setTimeout(function () { window.location.href = cfg.doneUrl; }, 2500);
+					}
+				}
+			}
+
+			function poll() {
+				post('lumos_backup_progress', cfg.progressNonce).then(function (res) {
+					failures = 0;
+					if (note === t.connection) { note = ''; }
+					if (res && res.success) { apply(res.data); }
+				}).catch(function () {
+					failures++;
+					if (failures >= 3) { note = t.connection; render(); }
+				});
+			}
+
+			function begin() {
+				stop();
+				pollTimer = setInterval(poll, 1500);
+				clockTimer = setInterval(render, 1000); // keeps elapsed / time left / last update live
+				poll();
+			}
+
+			form.addEventListener('submit', function (e) {
+				e.preventDefault();
+				note = '';
+				waitingFor = (state && state.run_id) || (cfg.initial && cfg.initial.run_id) || '';
+				waitStarted = Date.now();
+				state = { status: 'running', label: t.starting, percent: 0, started: Date.now() / 1000, updated: Date.now() / 1000, detail: '', stall_after: 120 };
+				clockSkew = 0;
+				render();
+				begin();
+				post('lumos_backup_start', cfg.startNonce).then(function (res) {
+					if (res && !res.success && res.data && res.data.progress) {
+						waitingFor = null; note = t.already; apply(res.data.progress);
+					} else if (res && !res.success) {
+						stop();
+						state = { status: 'error', message: (res.data && res.data.message) || t.failed, percent: 0, elapsed: 0 };
+						render();
+					}
+				}).catch(function () { /* A proxy may cut this long request; polling carries on. */ });
+			});
+
+			el('clear').addEventListener('click', function () {
+				var btn = el('clear');
+				btn.disabled = true;
+				post('lumos_backup_clear_stuck', cfg.progressNonce).then(function (res) {
+					btn.disabled = false;
+					if (res && res.success) { apply(res.data); el('alert').hidden = false; el('alert').textContent = t.cleared; }
+				});
+			});
+
+			// A backup already running (scheduled, or started in another tab): follow it.
+			if (cfg.initial && cfg.initial.status === 'running') {
+				state = cfg.initial;
+				clockSkew = cfg.initial.now - Date.now() / 1000;
+				render();
+				begin();
+			}
+		})();
+		</script>
+		<?php
+	}
+
+	/**
 	 * Display admin notices on redirect.
 	 */
 	public function display_notices() {
@@ -491,10 +808,10 @@ class Lumos_Backup_Admin {
 					<p><?php esc_html_e( 'Generate a complete snapshot containing your database dump, site manifest, and wp-content files.', 'lumos-backup' ); ?></p>
 					
 					<div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px;">
-						<form method="post" action="<?php echo esc_url( $action_url ); ?>">
+						<form method="post" action="<?php echo esc_url( $action_url ); ?>" id="lumos-backup-now-form">
 							<?php wp_nonce_field( 'lumos_backup_now' ); ?>
 							<input type="hidden" name="lumos_action" value="backup_now">
-							<button type="submit" class="button button-primary button-hero">
+							<button type="submit" class="button button-primary button-hero" id="lumos-backup-now-btn">
 								<?php esc_html_e( 'Backup Now', 'lumos-backup' ); ?>
 							</button>
 						</form>
@@ -502,11 +819,12 @@ class Lumos_Backup_Admin {
 						<form method="post" action="<?php echo esc_url( $action_url ); ?>">
 							<?php wp_nonce_field( 'lumos_backup_test_drill' ); ?>
 							<input type="hidden" name="lumos_action" value="test_drill">
-							<button type="submit" class="button button-secondary button-hero">
+							<button type="submit" class="button button-secondary button-hero" id="lumos-drill-btn">
 								&#9881; <?php esc_html_e( 'Test latest backup', 'lumos-backup' ); ?>
 							</button>
 						</form>
 					</div>
+					<?php $this->render_progress_panel(); ?>
 				</div>
 
 				<!-- Schedule & Retention Card -->

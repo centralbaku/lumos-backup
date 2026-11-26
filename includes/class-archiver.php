@@ -19,11 +19,13 @@ class Lumos_Backup_Archiver {
 	 * archives wp-content, handles optional AES-256-CBC encryption,
 	 * creates sha256 sidecars, uploads to S3, and prunes old backups.
 	 *
+	 * @param string $trigger What started the run: manual, schedule or update (shown in progress).
 	 * @return array|WP_Error Array of backup details on success, WP_Error on failure.
 	 */
-	public function create_backup() {
-		// Attempt to extend execution and memory limits
-		@set_time_limit( 600 );
+	public function create_backup( $trigger = 'manual' ) {
+		// Large sites can take longer than 10 minutes; progress shows if a run stalls.
+		@set_time_limit( 0 );
+		@ignore_user_abort( true );
 		if ( function_exists( 'wp_raise_memory_limit' ) ) {
 			wp_raise_memory_limit( 'admin' );
 		}
@@ -53,6 +55,8 @@ class Lumos_Backup_Archiver {
 
 		@file_put_contents( $lock_file, json_encode( [ 'pid' => getmypid(), 'time' => time() ] ) );
 
+		Lumos_Backup_Progress::start( $trigger );
+
 		try {
 			// Random suffix makes archive URLs unguessable even where .htaccess is ignored (Nginx).
 			$base_filename = sprintf( 'backup-%s-%s.zip', gmdate( 'Ymd-His' ), bin2hex( random_bytes( 8 ) ) );
@@ -67,9 +71,17 @@ class Lumos_Backup_Archiver {
 			}
 
 			// 2. Dump database in batches
+			// Progress budget: database 2-30%, file scan 30-32%, adding files 32-45%,
+			// compressing 45-90%, encryption 90-94%, checksum and uploads 94-99%.
+			Lumos_Backup_Progress::stage( 'database', __( 'Exporting database', 'lumos-backup' ), 2 );
 			$sql_file = $temp_dir . '/database.sql';
 			$db       = new Lumos_Backup_Database();
-			$db_res   = $db->dump_to_file( $sql_file );
+			$db_res   = $db->dump_to_file(
+				$sql_file,
+				function ( $fraction, $detail ) {
+					Lumos_Backup_Progress::tick( 2 + 28 * $fraction, $detail );
+				}
+			);
 
 			if ( is_wp_error( $db_res ) ) {
 				$this->cleanup_temp_dir( $temp_dir );
@@ -98,6 +110,20 @@ class Lumos_Backup_Archiver {
 
 			$this->add_content_to_zip( $zip );
 
+			// Compression happens inside close(). Report it when PHP supports it; otherwise
+			// allow a long silence so a big site is not wrongly reported as stuck.
+			if ( method_exists( $zip, 'registerProgressCallback' ) ) {
+				Lumos_Backup_Progress::stage( 'compress', __( 'Compressing archive', 'lumos-backup' ), 45 );
+				$zip->registerProgressCallback(
+					0.01,
+					function ( $rate ) {
+						Lumos_Backup_Progress::tick( 45 + 45 * $rate, sprintf( __( '%d%% compressed', 'lumos-backup' ), (int) round( $rate * 100 ) ) );
+					}
+				);
+			} else {
+				Lumos_Backup_Progress::stage( 'compress', __( 'Compressing archive (this step does not report progress)', 'lumos-backup' ), 45, 30 * MINUTE_IN_SECONDS );
+			}
+
 			$zip_closed = $zip->close();
 			if ( ! $zip_closed || ! file_exists( $temp_zip_path ) ) {
 				$this->cleanup_temp_dir( $temp_dir );
@@ -114,6 +140,7 @@ class Lumos_Backup_Archiver {
 			$final_archive_path  = $raw_zip_path;
 
 			if ( $is_encrypted ) {
+				Lumos_Backup_Progress::stage( 'encrypt', __( 'Encrypting archive', 'lumos-backup' ), 90, 15 * MINUTE_IN_SECONDS );
 				$passphrase   = Lumos_Backup_Restore_Gate::get_passphrase();
 				$enc_meta     = Lumos_Backup_Restore_Gate::get_encryption_meta();
 				$final_filename     = $base_filename . '.enc';
@@ -137,6 +164,7 @@ class Lumos_Backup_Archiver {
 			}
 
 			// 6. Compute sha256 checksum and write sidecar file (.sha256)
+			Lumos_Backup_Progress::stage( 'checksum', __( 'Verifying archive checksum', 'lumos-backup' ), 94, 10 * MINUTE_IN_SECONDS );
 			@chmod( $final_archive_path, 0600 );
 			$sha256 = hash_file( 'sha256', $final_archive_path );
 			$sidecar_path = $final_archive_path . '.sha256';
@@ -153,6 +181,7 @@ class Lumos_Backup_Archiver {
 			// 9. Upload to S3 remote destination if configured (upload both archive and .sha256 sidecar)
 			$s3_result = null;
 			if ( class_exists( 'Lumos_Backup_S3' ) && Lumos_Backup_S3::is_configured() ) {
+				Lumos_Backup_Progress::stage( 'upload', __( 'Uploading to S3', 'lumos-backup' ), 95, 35 * MINUTE_IN_SECONDS );
 				$upload_res = Lumos_Backup_S3::upload_file( $final_archive_path, $final_filename );
 				if ( is_wp_error( $upload_res ) ) {
 					$s3_result = [
@@ -178,6 +207,7 @@ class Lumos_Backup_Archiver {
 			// 9b. Upload to SFTP remote destination if configured (upload archive and sidecar)
 			$sftp_result = null;
 			if ( class_exists( 'Lumos_Backup_SFTP' ) && Lumos_Backup_SFTP::is_configured() ) {
+				Lumos_Backup_Progress::stage( 'upload', __( 'Uploading to SFTP', 'lumos-backup' ), 97, 10 * MINUTE_IN_SECONDS );
 				$sftp_upload = Lumos_Backup_SFTP::upload_file( $final_archive_path, $final_filename );
 				if ( is_wp_error( $sftp_upload ) ) {
 					$sftp_result = [
@@ -220,10 +250,20 @@ class Lumos_Backup_Archiver {
 			// 11. Write dead-server kit recovery.md next to config
 			self::generate_recovery_sheet( $final_filename, $sha256, $is_encrypted );
 
+			Lumos_Backup_Progress::finish(
+				'success',
+				'',
+				[
+					'filename'       => $final_filename,
+					'size_formatted' => $record['size_formatted'],
+				]
+			);
+
 			return $record;
 
 		} catch ( Exception $e ) {
 			$this->record_failure( $e->getMessage() );
+			Lumos_Backup_Progress::finish( 'error', $e->getMessage() );
 			return new WP_Error( 'backup_failed', $e->getMessage() );
 		} finally {
 			// Always release lock
@@ -365,6 +405,11 @@ class Lumos_Backup_Archiver {
 			RecursiveIteratorIterator::SELF_FIRST
 		);
 
+		// Pass 1: list what will be archived, so adding files can report "X of Y".
+		Lumos_Backup_Progress::stage( 'scan', __( 'Scanning wp-content files', 'lumos-backup' ), 30 );
+		$entries = [];
+		$bytes   = 0;
+
 		foreach ( $iterator as $item ) {
 			$pathname_normalized = wp_normalize_path( $item->getPathname() );
 
@@ -389,9 +434,43 @@ class Lumos_Backup_Archiver {
 			$zip_entry     = 'wp-content/' . $relative_path;
 
 			if ( $item->isDir() ) {
-				$zip->addEmptyDir( $zip_entry );
+				$entries[] = [ '', $zip_entry ];
 			} elseif ( $item->isFile() && is_readable( $item->getPathname() ) ) {
-				$zip->addFile( $item->getPathname(), $zip_entry );
+				$entries[] = [ $item->getPathname(), $zip_entry ];
+				$bytes    += (int) $item->getSize();
+			}
+
+			if ( 0 === count( $entries ) % 500 ) {
+				Lumos_Backup_Progress::tick( 30, sprintf( __( '%s items found', 'lumos-backup' ), number_format_i18n( count( $entries ) ) ) );
+			}
+		}
+
+		// Pass 2: add them to the archive (compression itself happens on close()).
+		$total = count( $entries );
+		Lumos_Backup_Progress::stage(
+			'files',
+			__( 'Adding files', 'lumos-backup' ),
+			32
+		);
+
+		foreach ( $entries as $i => $entry ) {
+			if ( '' === $entry[0] ) {
+				$zip->addEmptyDir( $entry[1] );
+			} else {
+				$zip->addFile( $entry[0], $entry[1] );
+			}
+
+			if ( 0 === $i % 200 || $i === $total - 1 ) {
+				Lumos_Backup_Progress::tick(
+					32 + 13 * ( ( $i + 1 ) / max( 1, $total ) ),
+					sprintf(
+						/* translators: 1: items done, 2: items total, 3: total size */
+						__( '%1$s of %2$s items (%3$s)', 'lumos-backup' ),
+						number_format_i18n( $i + 1 ),
+						number_format_i18n( $total ),
+						size_format( $bytes, 1 )
+					)
+				);
 			}
 		}
 	}

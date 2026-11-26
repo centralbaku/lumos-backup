@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.1.1] - 2026-11-20
 
+### Added
+- Live backup progress under **Backup Now**: stage, percent, detail (table/rows, files), elapsed time, time left, and last-update age. It warns when updates pause and flags a stuck run with a **Clear stuck backup** button. Scheduled backups show up too when the page is open.
+
 ### Security
 - Restore config is now `restore-config.php` with an exit guard, so no web server (including Nginx) can serve the database password or S3 keys. The old `restore-config.json` is deleted on the next config write.
 - New archive names include a random suffix (`backup-YYYYMMDD-HHMMSS-<16 hex>.zip`) and are chmod 0600, so they can't be guessed and downloaded where `.htaccess` is ignored.

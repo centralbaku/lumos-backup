@@ -91,7 +91,7 @@ class Lumos_Backup_Scheduler {
 		// Keep running even if the triggering HTTP connection closes.
 		@ignore_user_abort( true );
 		$archiver = new Lumos_Backup_Archiver();
-		$archiver->create_backup();
+		$archiver->create_backup( 'schedule' );
 	}
 
 	/**
