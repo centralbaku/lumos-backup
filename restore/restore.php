@@ -29,6 +29,10 @@ declare( strict_types=1 );
 error_reporting( E_ALL );
 ini_set( 'display_errors', '0' );
 
+// PHP 8.1+ makes mysqli throw on every SQL error by default. This script checks return
+// values itself (and must clean up staging tables on failure), so use classic reporting.
+mysqli_report( MYSQLI_REPORT_OFF );
+
 // Enforce privacy and security headers
 header( 'X-Robots-Tag: noindex, nofollow, noarchive' );
 header( 'X-Content-Type-Options: nosniff' );
@@ -42,6 +46,9 @@ header( 'Referrer-Policy: no-referrer' );
  */
 function lumos_find_config_file(): ?string {
 	$candidates = [
+		__DIR__ . '/wp-content/uploads/lumos-backup/restore-config.php',
+		dirname( __DIR__ ) . '/wp-content/uploads/lumos-backup/restore-config.php',
+		// Legacy plain-JSON location (plugin versions before 1.1.1).
 		__DIR__ . '/wp-content/uploads/lumos-backup/restore-config.json',
 		dirname( __DIR__ ) . '/wp-content/uploads/lumos-backup/restore-config.json',
 	];
@@ -472,7 +479,7 @@ function lumos_list_s3_archives( array $s3 ): array {
 		$key      = (string) $item->Key;
 		$filename = basename( $key );
 
-		if ( ! preg_match( '/^backup-\d{8}-\d{6}\.zip(\.enc)?$/', $filename ) ) {
+		if ( ! preg_match( '/^backup-\d{8}-\d{6}(-[a-f0-9]{16})?\.zip(\.enc)?$/', $filename ) ) {
 			continue;
 		}
 
@@ -921,24 +928,54 @@ function lumos_replace_domains_in_database( mysqli $mysqli, string $prefix, arra
  */
 function lumos_decrypt_archive( string $enc_path, string $dest_zip_path, string $passphrase, string $kdf_salt, int $iterations = 100000 ): bool {
 	$key = hash_pbkdf2( 'sha256', $passphrase, hex2bin( $kdf_salt ), $iterations, 32, true );
-	$raw = @file_get_contents( $enc_path );
-	if ( false === $raw || strlen( $raw ) < 17 ) {
+
+	// Stream-decrypt in 1 MB chunks so large archives do not exhaust memory.
+	$in = @fopen( $enc_path, 'rb' );
+	if ( ! $in ) {
+		return false;
+	}
+	$iv = (string) fread( $in, 16 );
+	if ( 16 !== strlen( $iv ) ) {
+		fclose( $in );
+		return false;
+	}
+	$out = @fopen( $dest_zip_path, 'wb' );
+	if ( ! $out ) {
+		fclose( $in );
 		return false;
 	}
 
-	$iv         = substr( $raw, 0, 16 );
-	$ciphertext = substr( $raw, 16 );
-	$plaintext  = openssl_decrypt( $ciphertext, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv );
-	unset( $ciphertext, $raw );
-
-	if ( false === $plaintext ) {
-		return false;
+	$ok    = true;
+	$chunk = 1048576;
+	$cur   = (string) fread( $in, $chunk );
+	if ( '' === $cur ) {
+		$ok = false;
 	}
 
-	$written = @file_put_contents( $dest_zip_path, $plaintext );
-	unset( $plaintext );
+	while ( $ok ) {
+		$next    = feof( $in ) ? '' : (string) fread( $in, $chunk );
+		$is_last = ( '' === $next );
+		$flags   = $is_last ? OPENSSL_RAW_DATA : ( OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING );
+		$pt      = openssl_decrypt( $cur, 'aes-256-cbc', $key, $flags, $iv );
 
-	return false !== $written;
+		if ( false === $pt || false === fwrite( $out, $pt ) ) {
+			$ok = false;
+			break;
+		}
+		if ( $is_last ) {
+			break;
+		}
+		$iv  = substr( $cur, -16 );
+		$cur = $next;
+	}
+
+	fclose( $in );
+	fclose( $out );
+	if ( ! $ok ) {
+		@unlink( $dest_zip_path );
+	}
+
+	return $ok;
 }
 
 /**
@@ -952,7 +989,159 @@ function lumos_decrypt_archive( string $enc_path, string $dest_zip_path, string 
  * @return array Stats array with statement and error counts.
  * @throws Exception If file cannot be read or serious failure occurs.
  */
-function lumos_execute_sql_dump( mysqli $mysqli, string $filepath ): array {
+/**
+ * Rewrite one dump statement so it targets a staging copy of its table.
+ *
+ * Returns null when the statement must not run: it targets a table outside this
+ * WordPress install's prefix, or is not a plain table/session statement.
+ *
+ * @param string $sql          Statement.
+ * @param string $live_prefix  WordPress table prefix (e.g. wp_).
+ * @param string $stage_prefix Prefix prepended to staged tables (e.g. lmrs_).
+ * @param array  $staged       Accumulates staged table names (stage => live).
+ * @return string|null
+ */
+function lumos_stage_statement( string $sql, string $live_prefix, string $stage_prefix, array &$staged ): ?string {
+	$sql = ltrim( $sql );
+
+	if ( preg_match( '/^(SET\s|UNLOCK\s+TABLES)/i', $sql ) ) {
+		return $sql;
+	}
+
+	$pattern = '/^((?:DROP\s+TABLE(?:\s+IF\s+EXISTS)?|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+(?:IGNORE\s+)?INTO|REPLACE\s+INTO|LOCK\s+TABLES|ALTER\s+TABLE)\s+)`([^`]+)`/i';
+	if ( ! preg_match( $pattern, $sql, $m ) ) {
+		return null;
+	}
+
+	$table = $m[2];
+	if ( '' === $live_prefix || 0 !== strpos( $table, $live_prefix ) ) {
+		return null; // Never touch tables that do not belong to this WordPress install.
+	}
+
+	$stage_name = $stage_prefix . $table;
+	if ( preg_match( '/^CREATE\s+TABLE/i', $sql ) ) {
+		$staged[ $stage_name ] = $table;
+	}
+
+	return $m[1] . '`' . $stage_name . '`' . substr( $sql, strlen( $m[0] ) );
+}
+
+/**
+ * Run a statement through optional staging and execute it.
+ *
+ * @param mysqli     $mysqli  Connection.
+ * @param string     $sql     Statement.
+ * @param array|null $staging [ 'live' => prefix, 'stage' => prefix ] or null for direct execution.
+ * @param array      $staged  Staged tables accumulator.
+ * @return bool|null True on success, false on error, null when skipped.
+ */
+function lumos_run_dump_statement( mysqli $mysqli, string $sql, ?array $staging, array &$staged ): ?bool {
+	if ( null !== $staging ) {
+		$sql = lumos_stage_statement( $sql, $staging['live'], $staging['stage'], $staged );
+		if ( null === $sql ) {
+			return null;
+		}
+	}
+	$GLOBALS['lumos_last_sql'] = $sql;
+	return (bool) @$mysqli->query( $sql );
+}
+
+/**
+ * Import a dump into staging tables, then atomically swap them in for the live tables.
+ *
+ * The live tables are untouched until every statement has succeeded. The final swap is
+ * a single RENAME TABLE statement, which MySQL applies atomically.
+ *
+ * @param mysqli $mysqli   Connection.
+ * @param string $filepath Path to database.sql.
+ * @param string $prefix   WordPress table prefix.
+ * @return array Stats.
+ * @throws Exception On any failure (live tables are left as they were).
+ */
+function lumos_import_sql_atomically( mysqli $mysqli, string $filepath, string $prefix ): array {
+	$stage = 'lmrs_';
+	$old   = 'lmold_';
+
+	// Remove leftovers from an earlier interrupted restore.
+	lumos_drop_tables_like( $mysqli, $stage . $prefix );
+	lumos_drop_tables_like( $mysqli, $old . $prefix );
+
+	$staged = [];
+	try {
+		$stats = lumos_execute_sql_dump( $mysqli, $filepath, [ 'live' => $prefix, 'stage' => $stage ], $staged );
+	} catch ( Throwable $t ) {
+		lumos_drop_tables_like( $mysqli, $stage . $prefix );
+		throw new Exception( 'SQL import failed (' . $t->getMessage() . '). Your live database was NOT changed.' );
+	}
+
+	if ( $stats['errors'] > 0 || empty( $staged ) ) {
+		lumos_drop_tables_like( $mysqli, $stage . $prefix );
+		$detail = $stats['errors'] > 0
+			? implode( '; ', array_slice( $stats['details'], 0, 3 ) )
+			: 'The archive contains no tables for prefix ' . $prefix;
+		throw new Exception( "SQL import failed ({$detail}). Your live database was NOT changed." );
+	}
+
+	foreach ( $staged as $stage_name => $live_name ) {
+		if ( strlen( $old . $live_name ) > 64 ) {
+			lumos_drop_tables_like( $mysqli, $stage . $prefix );
+			throw new Exception( "Table name too long to swap safely: {$live_name}. Your live database was NOT changed." );
+		}
+	}
+
+	// Build one atomic RENAME: live -> old, staged -> live.
+	$existing = [];
+	$res      = @$mysqli->query( "SHOW TABLES LIKE '" . $mysqli->real_escape_string( addcslashes( $prefix, '_%\\' ) ) . "%'" );
+	if ( $res ) {
+		while ( $row = $res->fetch_array() ) {
+			$existing[ $row[0] ] = true;
+		}
+		$res->free();
+	}
+
+	$pairs = [];
+	foreach ( $staged as $stage_name => $live_name ) {
+		if ( isset( $existing[ $live_name ] ) ) {
+			$pairs[] = "`{$live_name}` TO `{$old}{$live_name}`";
+		}
+		$pairs[] = "`{$stage_name}` TO `{$live_name}`";
+	}
+
+	if ( ! @$mysqli->query( 'RENAME TABLE ' . implode( ', ', $pairs ) ) ) {
+		$err = $mysqli->error;
+		lumos_drop_tables_like( $mysqli, $stage . $prefix );
+		throw new Exception( "Could not swap restored tables into place ({$err}). Your live database was NOT changed." );
+	}
+
+	lumos_drop_tables_like( $mysqli, $old . $prefix );
+
+	return $stats;
+}
+
+/**
+ * Drop every table whose name starts with the given string.
+ *
+ * @param mysqli $mysqli Connection.
+ * @param string $start  Name prefix.
+ */
+function lumos_drop_tables_like( mysqli $mysqli, string $start ): void {
+	$res = @$mysqli->query( "SHOW TABLES LIKE '" . $mysqli->real_escape_string( addcslashes( $start, '_%\\' ) ) . "%'" );
+	if ( ! $res ) {
+		return;
+	}
+	$names = [];
+	while ( $row = $res->fetch_array() ) {
+		$names[] = $row[0];
+	}
+	$res->free();
+	foreach ( $names as $name ) {
+		if ( 0 === strpos( $name, $start ) ) {
+			@$mysqli->query( 'DROP TABLE IF EXISTS `' . str_replace( '`', '``', $name ) . '`' );
+		}
+	}
+}
+
+function lumos_execute_sql_dump( mysqli $mysqli, string $filepath, ?array $staging = null, array &$staged = [] ): array {
 	$fp = @fopen( $filepath, 'r' );
 	if ( ! $fp ) {
 		throw new Exception( 'Could not open database dump file: ' . basename( $filepath ) );
@@ -1052,12 +1241,13 @@ function lumos_execute_sql_dump( mysqli $mysqli, string $filepath ): array {
 			if ( ! $in_single_quote && ! $in_double_quote && ! $in_backtick && substr( $line, $i, $delim_len ) === $current_delimiter ) {
 				$sql = trim( $query );
 				if ( '' !== $sql ) {
-					if ( ! @$mysqli->query( $sql ) ) {
+					$ran = lumos_run_dump_statement( $mysqli, $sql, $staging, $staged );
+					if ( false === $ran ) {
 						$error_count++;
 						if ( count( $errors ) < 5 ) {
 							$errors[] = $mysqli->error . ' [SQL: ' . substr( $sql, 0, 80 ) . '...]';
 						}
-					} else {
+					} elseif ( true === $ran ) {
 						$statement_count++;
 					}
 				}
@@ -1074,12 +1264,13 @@ function lumos_execute_sql_dump( mysqli $mysqli, string $filepath ): array {
 	// Remainder statement
 	$sql = trim( $query );
 	if ( '' !== $sql ) {
-		if ( ! @$mysqli->query( $sql ) ) {
+		$ran = lumos_run_dump_statement( $mysqli, $sql, $staging, $staged );
+		if ( false === $ran ) {
 			$error_count++;
 			if ( count( $errors ) < 5 ) {
 				$errors[] = $mysqli->error;
 			}
-		} else {
+		} elseif ( true === $ran ) {
 			$statement_count++;
 		}
 	}
@@ -1148,6 +1339,7 @@ function lumos_restore_content_files( string $source_content, string $target_con
 			'lumos-restore.php' === $basename ||
 			'wp-config.php' === $basename ||
 			'restore-config.json' === $basename ||
+			'restore-config.php' === $basename ||
 			'recovery.md' === $basename ||
 			'.lumos-maintenance' === $basename
 		) {
@@ -1217,6 +1409,11 @@ if ( null === $config_path ) {
 }
 
 $config_raw = @file_get_contents( $config_path );
+if ( is_string( $config_raw ) && 0 === strpos( $config_raw, '<?php' ) ) {
+	// Strip the PHP exit guard line written by the plugin.
+	$guard_end  = strpos( $config_raw, "\n" );
+	$config_raw = false === $guard_end ? '' : substr( $config_raw, $guard_end + 1 );
+}
 $config     = $config_raw ? json_decode( $config_raw, true ) : null;
 
 if ( ! is_array( $config ) || empty( $config['token_hash'] ) ) {
@@ -1257,7 +1454,7 @@ if ( ! hash_equals( $config['token_hash'], $input_hash ) ) {
 	lumos_record_failed_key( $rate_limits_file, $client_ip );
 	lumos_exit_with_error(
 		'403 Forbidden',
-		'Invalid or expired restore token. Verify your link or rotate the key in WordPress Tools → Lumos Backup.',
+		'Invalid or expired restore token. Verify your link or rotate the key in WordPress LUMOS → Backup.',
 		403
 	);
 }
@@ -1419,6 +1616,8 @@ if ( $encryption_enabled ) {
 }
 
 $maintenance_file = rtrim( $config['abspath'] ?? __DIR__, '/\\' ) . '/.lumos-maintenance';
+$wp_maintenance_file    = rtrim( $config['abspath'] ?? __DIR__, '/\\' ) . '/.maintenance';
+$wp_maintenance_created = false;
 $s3_configured    = ! empty( $config['s3']['bucket'] ) && ! empty( $config['s3']['access_key'] ) && ! empty( $config['s3']['secret_key'] );
 
 $current_do = $_POST['do'] ?? ( $_GET['do'] ?? '' );
@@ -1430,7 +1629,7 @@ $s3_key     = trim( (string) ( $_POST['s3_key'] ?? ( $_GET['s3_key'] ?? '' ) ) )
 // STEP 1: CONFIRMATION VIEW (Two-step confirmation + Domain Change form)
 // ============================================================================
 if ( 'confirm' === $current_do && '' !== $archive_id ) {
-	if ( ! preg_match( '/^backup-\d{8}-\d{6}\.zip(\.enc)?$/', $archive_id ) ) {
+	if ( ! preg_match( '/^backup-\d{8}-\d{6}(-[a-f0-9]{16})?\.zip(\.enc)?$/', $archive_id ) ) {
 		lumos_exit_with_error( '400 Bad Request', 'Invalid backup identifier.', 400 );
 	}
 
@@ -1741,7 +1940,7 @@ if ( 'POST' === $_SERVER['REQUEST_METHOD'] && 'restore' === $current_do ) {
 	$archive_id = trim( (string) ( $_POST['id'] ?? '' ) );
 	$origin     = trim( (string) ( $_POST['origin'] ?? 'local' ) );
 
-	if ( ! preg_match( '/^backup-\d{8}-\d{6}\.zip(\.enc)?$/', $archive_id ) ) {
+	if ( ! preg_match( '/^backup-\d{8}-\d{6}(-[a-f0-9]{16})?\.zip(\.enc)?$/', $archive_id ) ) {
 		$action_result = [
 			'success' => false,
 			'message' => 'Invalid backup filename identifier. Must match backup-YYYYMMDD-HHMMSS.zip(.enc).',
@@ -1909,13 +2108,19 @@ if ( 'POST' === $_SERVER['REQUEST_METHOD'] && 'restore' === $current_do ) {
 					$charset = ! empty( $config['db_charset'] ) ? $config['db_charset'] : 'utf8mb4';
 					@$mysqli->set_charset( $charset );
 
-					$sql_stats = lumos_execute_sql_dump( $mysqli, $sql_file );
-
-					// CRITICAL FAILURE BOUNDARY: On SQL failure, STOP! Do not start the file copy!
-					if ( $sql_stats['errors'] > 0 ) {
-						$err_summary = implode( '; ', array_slice( $sql_stats['details'], 0, 3 ) );
+					// Import into staging tables and swap atomically. On any failure this throws
+					// and the live database is left exactly as it was; file copy never starts.
+					$prefix = $config['db_prefix'] ?? 'wp_';
+					try {
+						$sql_stats = lumos_import_sql_atomically( $mysqli, $sql_file, $prefix );
+					} catch ( Exception $import_error ) {
 						$mysqli->close();
-						throw new Exception( "SQL import failed with {$sql_stats['errors']} error(s) ({$err_summary}). File restoration halted." );
+						throw $import_error;
+					}
+
+					// Show WordPress's own maintenance screen to visitors while URLs and files are updated.
+					if ( ! file_exists( $wp_maintenance_file ) ) {
+						$wp_maintenance_created = false !== @file_put_contents( $wp_maintenance_file, '<?php $upgrading = ' . time() . '; ?>' );
 					}
 
 					// 5. DOMAIN CHANGE ON RESTORE (Serialized-Safe)
@@ -1946,7 +2151,6 @@ if ( 'POST' === $_SERVER['REQUEST_METHOD'] && 'restore' === $current_do ) {
 						}
 					}
 
-					$prefix = $config['db_prefix'] ?? 'wp_';
 					lumos_replace_domains_in_database( $mysqli, $prefix, $replacements, $new_siteurl, $new_home );
 
 					$mysqli->close();
@@ -1996,6 +2200,11 @@ if ( 'POST' === $_SERVER['REQUEST_METHOD'] && 'restore' === $current_do ) {
 					@unlink( $temp_decrypted );
 				}
 
+				// Remove the WordPress maintenance file only if this restore created it.
+				if ( $wp_maintenance_created && file_exists( $wp_maintenance_file ) ) {
+					@unlink( $wp_maintenance_file );
+				}
+
 				// CRITICAL: Delete ABSPATH/.lumos-maintenance after success or failure
 				if ( file_exists( $maintenance_file ) ) {
 					@unlink( $maintenance_file );
@@ -2014,7 +2223,7 @@ if ( is_dir( $archive_dir ) && is_readable( $archive_dir ) ) {
 	$scanned = scandir( $archive_dir );
 	if ( false !== $scanned ) {
 		foreach ( $scanned as $item ) {
-			if ( ! preg_match( '/^backup-\d{8}-\d{6}\.zip(\.enc)?$/', $item ) ) {
+			if ( ! preg_match( '/^backup-\d{8}-\d{6}(-[a-f0-9]{16})?\.zip(\.enc)?$/', $item ) ) {
 				continue;
 			}
 			$path = $archive_dir . DIRECTORY_SEPARATOR . $item;

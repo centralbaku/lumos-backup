@@ -284,6 +284,12 @@ class Lumos_Backup_S3 {
 
 		$signed_headers = self::sign_request( 'PUT', $url_parts, $headers, $payload_hash );
 
+		// Prefer streaming the file from disk with cURL so large archives are never
+		// loaded into PHP memory.
+		if ( function_exists( 'curl_init' ) ) {
+			return self::stream_put( $url_parts['url'], $signed_headers, $file_path, $file_size );
+		}
+
 		$content = file_get_contents( $file_path );
 		if ( false === $content ) {
 			return new WP_Error( 'file_read_error', __( 'Could not read backup file for S3 upload.', 'lumos-backup' ) );
@@ -316,6 +322,70 @@ class Lumos_Backup_S3 {
 					__( 'S3 upload returned HTTP status %1$d: %2$s', 'lumos-backup' ),
 					$status_code,
 					substr( wp_strip_all_tags( $body ), 0, 300 )
+				)
+			);
+		}
+
+		return true;
+	}
+
+	/**
+	 * Stream a file to S3 with a signed PUT request without reading it into memory.
+	 *
+	 * @param string $url       Request URL.
+	 * @param array  $headers   Signed headers (name => value).
+	 * @param string $file_path Local file to send.
+	 * @param int    $file_size File size in bytes.
+	 * @return true|WP_Error
+	 */
+	private static function stream_put( $url, array $headers, $file_path, $file_size ) {
+		$fp = @fopen( $file_path, 'rb' );
+		if ( ! $fp ) {
+			return new WP_Error( 'file_read_error', __( 'Could not read backup file for S3 upload.', 'lumos-backup' ) );
+		}
+
+		$header_lines = [ 'Expect:' ];
+		foreach ( $headers as $name => $value ) {
+			if ( 'host' === strtolower( $name ) ) {
+				continue; // cURL sets Host from the URL.
+			}
+			$header_lines[] = $name . ': ' . $value;
+		}
+
+		$ch = curl_init( $url );
+		curl_setopt_array(
+			$ch,
+			[
+				CURLOPT_PUT            => true,
+				CURLOPT_INFILE         => $fp,
+				CURLOPT_INFILESIZE     => $file_size,
+				CURLOPT_HTTPHEADER     => $header_lines,
+				CURLOPT_RETURNTRANSFER => true,
+				CURLOPT_TIMEOUT        => 1800,
+				CURLOPT_CONNECTTIMEOUT => 30,
+				CURLOPT_SSL_VERIFYPEER => true,
+				CURLOPT_SSL_VERIFYHOST => 2,
+			]
+		);
+
+		$body   = curl_exec( $ch );
+		$errno  = curl_errno( $ch );
+		$error  = curl_error( $ch );
+		$status = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+		curl_close( $ch );
+		fclose( $fp );
+
+		if ( $errno ) {
+			return new WP_Error( 's3_upload_failed', sprintf( __( 'S3 upload failed: %s', 'lumos-backup' ), $error ) );
+		}
+		if ( $status < 200 || $status >= 300 ) {
+			return new WP_Error(
+				's3_upload_failed',
+				sprintf(
+					/* translators: 1: HTTP status code, 2: Response body */
+					__( 'S3 upload returned HTTP status %1$d: %2$s', 'lumos-backup' ),
+					$status,
+					substr( wp_strip_all_tags( (string) $body ), 0, 300 )
 				)
 			);
 		}

@@ -17,7 +17,7 @@ class Lumos_Backup_Storage {
 	/**
 	 * Regex pattern for backup filenames (supports plain .zip and encrypted .zip.enc).
 	 */
-	const ARCHIVE_PATTERN = '/^backup-\d{8}-\d{6}\.zip(\.enc)?$/';
+	const ARCHIVE_PATTERN = '/^backup-\d{8}-\d{6}(-[a-f0-9]{16})?\.zip(\.enc)?$/';
 
 	/**
 	 * Get the base directory for Lumos Backup files.
@@ -48,8 +48,24 @@ class Lumos_Backup_Storage {
 	 * @return string
 	 */
 	public static function get_config_path() {
+		// Stored as a .php file whose first line exits, so no web server (Apache or Nginx)
+		// will ever serve its contents as plain text.
+		return self::get_base_dir() . '/restore-config.php';
+	}
+
+	/**
+	 * Get path to the legacy (pre-1.1.1) plain JSON config, which is removed when found.
+	 *
+	 * @return string
+	 */
+	public static function get_legacy_config_path() {
 		return self::get_base_dir() . '/restore-config.json';
 	}
+
+	/**
+	 * Header line that prevents the config file from ever being output over HTTP.
+	 */
+	const CONFIG_GUARD = "<?php exit; ?>\n";
 
 	/**
 	 * Get path to the recovery.md dead-server kit file.
@@ -232,7 +248,7 @@ class Lumos_Backup_Storage {
 	 * @return string UTC formatted date YYYY-MM-DD HH:MM:SS
 	 */
 	public static function parse_date_from_filename( $filename, $fallback_timestamp ) {
-		if ( preg_match( '/^backup-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.zip/', $filename, $matches ) ) {
+		if ( preg_match( '/^backup-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-[a-f0-9]{16})?\.zip/', $filename, $matches ) ) {
 			return sprintf( '%s-%s-%s %s:%s:%s', $matches[1], $matches[2], $matches[3], $matches[4], $matches[5], $matches[6] );
 		}
 		return gmdate( 'Y-m-d H:i:s', $fallback_timestamp );
