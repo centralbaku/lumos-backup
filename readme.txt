@@ -71,7 +71,7 @@ Please take note of the operational boundaries and technical limits:
    - Deploys `lumos-restore.php` to your WordPress root directory (`ABSPATH`).
    - Writes `wp-content/uploads/lumos-backup/restore-config.json` with mode `0600`.
    - Schedules the daily backup WP-Cron task.
-4. Navigate to **Tools → Lumos Backup** (or Network Admin → Lumos Backup) to configure your remote destinations, set automated restore drill schedules, and copy your private recovery link.
+4. Navigate to **LUMOS → Backup** (or Network Admin → Lumos Backup) to configure your remote destinations, set automated restore drill schedules, and copy your private recovery link.
 
 == Frequently Asked Questions ==
 

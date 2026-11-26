@@ -1454,7 +1454,7 @@ if ( ! hash_equals( $config['token_hash'], $input_hash ) ) {
 	lumos_record_failed_key( $rate_limits_file, $client_ip );
 	lumos_exit_with_error(
 		'403 Forbidden',
-		'Invalid or expired restore token. Verify your link or rotate the key in WordPress Tools → Lumos Backup.',
+		'Invalid or expired restore token. Verify your link or rotate the key in WordPress LUMOS → Backup.',
 		403
 	);
 }

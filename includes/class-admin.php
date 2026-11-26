@@ -52,19 +52,21 @@ class Lumos_Backup_Admin {
 		if ( is_multisite() && is_network_admin() ) {
 			return network_admin_url( 'admin.php?page=lumos-backup' );
 		}
-		return admin_url( 'tools.php?page=lumos-backup' );
+		return admin_url( 'admin.php?page=lumos-backup' );
 	}
 
 	/**
 	 * Register Tools menu item for standard admin.
 	 */
 	public function register_menu() {
-		add_management_page(
-			__( 'Lumos Backup', 'lumos-backup' ),
-			__( 'Lumos Backup', 'lumos-backup' ),
-			self::get_capability(),
+		// Listed as "Backup" under the shared LUMOS menu.
+		lumos_menu_add_product(
 			'lumos-backup',
-			[ $this, 'render_page' ]
+			__( 'Backup', 'lumos-backup' ),
+			[ $this, 'render_page' ],
+			__( 'Daily backups with an emergency restore page.', 'lumos-backup' ),
+			self::get_capability(),
+			'dashicons-shield-alt'
 		);
 	}
 
@@ -304,7 +306,7 @@ class Lumos_Backup_Admin {
 	 */
 	public function display_notices() {
 		$screen = get_current_screen();
-		if ( ! $screen || 'tools_page_lumos-backup' !== $screen->id ) {
+		if ( ! $screen || false === strpos( $screen->id, 'lumos-backup' ) ) {
 			return;
 		}
 
@@ -378,7 +380,7 @@ class Lumos_Backup_Admin {
 	}
 
 	/**
-	 * Render the Tools → Lumos Backup admin interface.
+	 * Render the LUMOS → Backup admin interface.
 	 */
 	public function render_page() {
 		if ( ! current_user_can( self::get_capability() ) ) {
@@ -903,7 +905,7 @@ class Lumos_Backup_Admin {
 										'lumos_action' => 'download',
 										'archive'      => $arch['filename'],
 									],
-									admin_url( 'tools.php' )
+									admin_url( 'admin.php' )
 								),
 								'lumos_download_' . $arch['filename']
 							) : '';
@@ -914,7 +916,7 @@ class Lumos_Backup_Admin {
 										'lumos_action' => 'delete',
 										'archive'      => $arch['filename'],
 									],
-									admin_url( 'tools.php' )
+									admin_url( 'admin.php' )
 								),
 								'lumos_delete_' . $arch['filename']
 							) : '';

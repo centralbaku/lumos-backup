@@ -24,6 +24,9 @@ define( 'LUMOS_BACKUP_PATH', plugin_dir_path( __FILE__ ) );
 define( 'LUMOS_BACKUP_URL', plugin_dir_url( __FILE__ ) );
 define( 'LUMOS_BACKUP_BASENAME', plugin_basename( __FILE__ ) );
 
+// Shared LUMOS admin menu (identical copy ships in every Lumos plugin)
+require_once LUMOS_BACKUP_PATH . 'includes/lumos-menu.php';
+
 // Load class files
 require_once LUMOS_BACKUP_PATH . 'includes/class-storage.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-database.php';

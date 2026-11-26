@@ -219,8 +219,8 @@ class Lumos_Backup_Scheduler {
 		$body .= "Error:      " . $error_msg . "\n";
 		$body .= "--------------------------------------------------------\n\n";
 		$body .= "Because the restore drill failed, this backup archive cannot be guaranteed recoverable in an emergency.\n";
-		$body .= "Please log into WordPress admin and check Tools -> Lumos Backup for full diagnostics.\n\n";
-		$body .= "Admin URL: " . admin_url( 'tools.php?page=lumos-backup' ) . "\n\n";
+		$body .= "Please log into WordPress admin and check LUMOS -> Backup for full diagnostics.\n\n";
+		$body .= "Admin URL: " . admin_url( 'admin.php?page=lumos-backup' ) . "\n\n";
 		$body .= "--\nLumos Backup Automated Health Monitor";
 
 		$headers = [ 'Content-Type: text/plain; charset=UTF-8' ];
