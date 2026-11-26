@@ -10,6 +10,7 @@
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       lumos-backup
+ * Update URI:        https://github.com/centralbaku/lumos-backup
  *
  * @package LumosBackup
  */
@@ -27,6 +28,10 @@ define( 'LUMOS_BACKUP_BASENAME', plugin_basename( __FILE__ ) );
 // Shared LUMOS admin menu (identical copy ships in every Lumos plugin)
 require_once LUMOS_BACKUP_PATH . 'includes/lumos-menu.php';
 
+// Shared GitHub updater: every version pushed to main is offered as a WordPress update.
+require_once LUMOS_BACKUP_PATH . 'includes/lumos-updater.php';
+new Lumos_GitHub_Updater( __FILE__, 'centralbaku/lumos-backup', LUMOS_BACKUP_VERSION );
+
 // Load class files
 require_once LUMOS_BACKUP_PATH . 'includes/class-storage.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-database.php';
@@ -38,7 +43,6 @@ require_once LUMOS_BACKUP_PATH . 'includes/class-scheduler.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-restore-gate.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-admin.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-cli.php';
-require_once LUMOS_BACKUP_PATH . 'includes/class-updater.php';
 
 // Register WP-CLI commands when running under CLI
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
@@ -89,10 +93,6 @@ register_deactivation_hook( __FILE__, 'lumos_backup_deactivate' );
  * Initialize plugin components on plugins_loaded.
  */
 function lumos_backup_init() {
-	// Initialize GitHub self-hosted auto-updater
-	$updater = new Lumos_Backup_Updater( LUMOS_BACKUP_BASENAME, LUMOS_BACKUP_VERSION );
-	$updater->init();
-
 	// Initialize daily cron listener
 	$scheduler = new Lumos_Backup_Scheduler();
 	$scheduler->init();
