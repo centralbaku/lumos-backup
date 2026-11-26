@@ -15,6 +15,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Lumos_Backup_Archiver {
 
 	/**
+	 * Generated image sizes left out of the current backup: [ count, bytes ].
+	 *
+	 * @var array
+	 */
+	private $skipped_thumbs = [ 0, 0 ];
+
+	/**
 	 * Run full backup: dumps database in batches, creates manifest,
 	 * archives wp-content, handles optional AES-256-CBC encryption,
 	 * creates sha256 sidecars, uploads to S3, and prunes old backups.
@@ -236,6 +243,8 @@ class Lumos_Backup_Archiver {
 				'sha256'         => $sha256,
 				'is_encrypted'   => $is_encrypted,
 				'status'         => 'success',
+				'thumbs_skipped' => $this->skipped_thumbs[0],
+				'thumbs_bytes'   => $this->skipped_thumbs[1],
 			];
 
 			if ( null !== $s3_result ) {
@@ -367,6 +376,8 @@ class Lumos_Backup_Archiver {
 			'sha256'         => $checksum,
 			'is_multisite'   => $is_ms,
 			'subsites'       => $subsites,
+			// Restores rebuild generated image sizes when they were left out.
+			'thumbnails_excluded' => Lumos_Backup_Thumbnails::is_skip_enabled(),
 			'included_paths' => [
 				'manifest.json',
 				'database.sql',
@@ -410,6 +421,9 @@ class Lumos_Backup_Archiver {
 		$entries = [];
 		$bytes   = 0;
 
+		// Generated image sizes to leave out (only when the setting is on).
+		$skip = Lumos_Backup_Thumbnails::is_skip_enabled() ? Lumos_Backup_Thumbnails::get_generated_paths() : [];
+
 		foreach ( $iterator as $item ) {
 			$pathname_normalized = wp_normalize_path( $item->getPathname() );
 
@@ -435,6 +449,9 @@ class Lumos_Backup_Archiver {
 
 			if ( $item->isDir() ) {
 				$entries[] = [ '', $zip_entry ];
+			} elseif ( $skip && isset( $skip[ $pathname_normalized ] ) ) {
+				$this->skipped_thumbs[0]++;
+				$this->skipped_thumbs[1] += (int) $item->getSize();
 			} elseif ( $item->isFile() && is_readable( $item->getPathname() ) ) {
 				$entries[] = [ $item->getPathname(), $zip_entry ];
 				$bytes    += (int) $item->getSize();
@@ -469,7 +486,12 @@ class Lumos_Backup_Archiver {
 						number_format_i18n( $i + 1 ),
 						number_format_i18n( $total ),
 						size_format( $bytes, 1 )
-					)
+					) . ( $this->skipped_thumbs[0] ? ' · ' . sprintf(
+						/* translators: 1: thumbnail count, 2: size */
+						__( '%1$s thumbnails skipped (%2$s)', 'lumos-backup' ),
+						number_format_i18n( $this->skipped_thumbs[0] ),
+						size_format( $this->skipped_thumbs[1], 1 )
+					) : '' )
 				);
 			}
 		}

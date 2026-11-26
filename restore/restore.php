@@ -2153,6 +2153,21 @@ if ( 'POST' === $_SERVER['REQUEST_METHOD'] && 'restore' === $current_do ) {
 
 					lumos_replace_domains_in_database( $mysqli, $prefix, $replacements, $new_siteurl, $new_home );
 
+					// Backups made with "skip generated image sizes" leave out thumbnails. Ask
+					// the plugin to rebuild them in the background once WordPress is running.
+					$manifest_path = $extract_dir . DIRECTORY_SEPARATOR . 'manifest.json';
+					$manifest_data = file_exists( $manifest_path ) ? json_decode( (string) file_get_contents( $manifest_path ), true ) : null;
+					if ( is_array( $manifest_data ) && ! empty( $manifest_data['thumbnails_excluded'] ) ) {
+						$opt_table = '`' . str_replace( '`', '``', $prefix . 'options' ) . '`';
+						$opt_value = $mysqli->real_escape_string( serialize( [ 'status' => 'pending', 'requested' => time() ] ) );
+						@$mysqli->query(
+							"INSERT INTO {$opt_table} (option_name, option_value, autoload)
+							 VALUES ('lumos_backup_thumb_rebuild', '{$opt_value}', 'yes')
+							 ON DUPLICATE KEY UPDATE option_value = VALUES(option_value), autoload = 'yes'"
+						);
+						$thumbs_rebuild_requested = true;
+					}
+
 					$mysqli->close();
 				}
 
@@ -2167,6 +2182,7 @@ if ( 'POST' === $_SERVER['REQUEST_METHOD'] && 'restore' === $current_do ) {
 					'db_statements'  => $sql_stats['statements'],
 					'db_errors'      => $sql_stats['errors'],
 					'files_restored' => $content_stats['restored'],
+					'thumbs_rebuild' => ! empty( $thumbs_rebuild_requested ),
 				];
 
 				lumos_log_restore(
@@ -2467,6 +2483,9 @@ $admin_url = rtrim( $site_url, '/' ) . '/wp-admin/';
 					<ul style="margin-left: 20px; margin-top: 8px;">
 						<li>Executed <strong><?php echo (int) $action_result['db_statements']; ?></strong> database statements.</li>
 						<li>Restored <strong><?php echo (int) $action_result['files_restored']; ?></strong> wp-content files.</li>
+						<?php if ( ! empty( $action_result['thumbs_rebuild'] ) ) : ?>
+							<li>This backup left out generated image sizes. Lumos Backup rebuilds them in the background once WordPress is running; open any page or the admin to start it. Some images may look broken until it finishes.</li>
+						<?php endif; ?>
 					</ul>
 					<div style="margin-top: 16px;">
 						<a href="<?php echo $admin_url; ?>" class="btn btn-primary" style="margin-right: 8px;">Log in to WordPress Admin</a>

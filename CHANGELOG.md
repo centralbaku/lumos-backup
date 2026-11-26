@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.1] - 2026-11-20
 
 ### Added
+- **Skip generated image sizes** (setting under Retention & Schedule, off by default): backups leave out the thumbnails and resized copies WordPress lists for each upload, keeping all originals (including `-scaled` images). After restoring such a backup, the missing sizes are rebuilt in the background in short batches, with progress shown on the Backup page. Not available on multisite.
 - Live backup progress under **Backup Now**: stage, percent, detail (table/rows, files), elapsed time, time left, and last-update age. It warns when updates pause and flags a stuck run with a **Clear stuck backup** button. Scheduled backups show up too when the page is open.
 
 ### Security

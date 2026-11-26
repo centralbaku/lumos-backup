@@ -35,6 +35,7 @@ new Lumos_GitHub_Updater( __FILE__, 'centralbaku/lumos-backup', LUMOS_BACKUP_VER
 // Load class files
 require_once LUMOS_BACKUP_PATH . 'includes/class-storage.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-progress.php';
+require_once LUMOS_BACKUP_PATH . 'includes/class-thumbnails.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-database.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-s3.php';
 require_once LUMOS_BACKUP_PATH . 'includes/class-sftp.php';
@@ -97,6 +98,9 @@ function lumos_backup_init() {
 	// Initialize daily cron listener
 	$scheduler = new Lumos_Backup_Scheduler();
 	$scheduler->init();
+
+	// Rebuilds image sizes after restoring a backup made with "skip generated image sizes".
+	Lumos_Backup_Thumbnails::init();
 
 	// Initialize admin screens and actions
 	if ( is_admin() ) {

@@ -131,6 +131,7 @@ class Lumos_Backup_Admin {
 				$keep = isset( $_POST['lumos_backup_keep'] ) ? absint( $_POST['lumos_backup_keep'] ) : 7;
 				$keep = max( 1, min( 100, $keep ) );
 				update_option( 'lumos_backup_keep', $keep );
+				update_option( Lumos_Backup_Thumbnails::OPTION_SKIP, ! empty( $_POST['lumos_backup_skip_thumbnails'] ) ? 1 : 0 );
 
 				// Prune archives to match new retention limit
 				Lumos_Backup_Storage::purge_old_archives( $keep );
@@ -738,6 +739,45 @@ class Lumos_Backup_Admin {
 			</p>
 			<hr class="wp-header-end">
 
+			<?php
+			$thumb_state = Lumos_Backup_Thumbnails::get_state();
+			if ( ! empty( $thumb_state['status'] ) && 'done' !== $thumb_state['status'] ) :
+				$t_total = max( 1, (int) ( $thumb_state['total'] ?? 0 ) );
+				$t_done  = (int) ( $thumb_state['done'] ?? 0 );
+				?>
+				<div class="notice notice-info inline" style="margin-top: 15px;">
+					<p>
+						<strong><?php esc_html_e( 'Rebuilding image thumbnails after restore:', 'lumos-backup' ); ?></strong>
+						<?php
+						if ( 'pending' === $thumb_state['status'] ) {
+							esc_html_e( 'starting…', 'lumos-backup' );
+						} else {
+							printf(
+								/* translators: 1: images done, 2: images total, 3: percent */
+								esc_html__( '%1$s of %2$s images (%3$s%%). This runs in the background; some images may look broken until it finishes.', 'lumos-backup' ),
+								esc_html( number_format_i18n( $t_done ) ),
+								esc_html( number_format_i18n( $t_total ) ),
+								esc_html( (string) floor( 100 * $t_done / $t_total ) )
+							);
+						}
+						?>
+					</p>
+				</div>
+			<?php elseif ( ! empty( $thumb_state['finished'] ) && ( time() - (int) $thumb_state['finished'] ) < DAY_IN_SECONDS ) : ?>
+				<div class="notice notice-success inline is-dismissible" style="margin-top: 15px;">
+					<p>
+						<?php
+						printf(
+							/* translators: 1: sizes created, 2: images checked */
+							esc_html__( 'Image thumbnails rebuilt after restore: %1$s sizes created for %2$s images.', 'lumos-backup' ),
+							esc_html( number_format_i18n( (int) ( $thumb_state['created'] ?? 0 ) ) ),
+							esc_html( number_format_i18n( (int) ( $thumb_state['done'] ?? 0 ) ) )
+						);
+						?>
+					</p>
+				</div>
+			<?php endif; ?>
+
 			<?php if ( is_multisite() ) : ?>
 				<div class="notice notice-info inline" style="margin-top: 15px;">
 					<p><strong><?php esc_html_e( 'WordPress Multisite Network Detected:', 'lumos-backup' ); ?></strong> <?php esc_html_e( 'Lumos Backup creates complete snapshots of the entire multisite network (all subsites, shared tables, and network uploads). Standalone emergency restore handles network tables (wp_site, wp_blogs, wp_sitemeta) and subsite options tables automatically.', 'lumos-backup' ); ?></p>
@@ -853,6 +893,18 @@ class Lumos_Backup_Admin {
 								<?php esc_html_e( 'Save Retention', 'lumos-backup' ); ?>
 							</button>
 						</div>
+
+						<?php if ( Lumos_Backup_Thumbnails::is_supported() ) : ?>
+							<label style="display: flex; gap: 8px; align-items: flex-start; margin-top: 14px;">
+								<input type="checkbox" name="lumos_backup_skip_thumbnails" value="1" <?php checked( Lumos_Backup_Thumbnails::is_skip_enabled() ); ?> style="margin-top: 3px;">
+								<span>
+									<strong><?php esc_html_e( 'Skip generated image sizes', 'lumos-backup' ); ?></strong><br>
+									<span class="description">
+										<?php esc_html_e( 'Smaller backups: leaves out the thumbnails and resized copies WordPress makes from each upload. Original images are always kept. After a restore, the missing sizes are rebuilt in the background; images may show as broken until that finishes, and it uses extra server CPU. Click Save Retention to apply.', 'lumos-backup' ); ?>
+									</span>
+								</span>
+							</label>
+						<?php endif; ?>
 					</form>
 				</div>
 
@@ -882,6 +934,19 @@ class Lumos_Backup_Admin {
 							<p>
 								<strong><?php esc_html_e( 'Archive Size:', 'lumos-backup' ); ?></strong>
 								<?php echo esc_html( $last_run['size_formatted'] ); ?>
+							</p>
+						<?php endif; ?>
+						<?php if ( ! empty( $last_run['thumbs_skipped'] ) ) : ?>
+							<p>
+								<strong><?php esc_html_e( 'Image sizes skipped:', 'lumos-backup' ); ?></strong>
+								<?php
+								printf(
+									/* translators: 1: number of files, 2: size */
+									esc_html__( '%1$s files (%2$s saved)', 'lumos-backup' ),
+									esc_html( number_format_i18n( $last_run['thumbs_skipped'] ) ),
+									esc_html( size_format( (int) $last_run['thumbs_bytes'], 1 ) )
+								);
+								?>
 							</p>
 						<?php endif; ?>
 						<?php if ( ! empty( $last_run['sha256'] ) ) : ?>
