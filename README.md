@@ -38,7 +38,9 @@ When you make code changes on your Mac, follow these simple steps to push update
 
 ## ⚡ How WordPress Receives Updates
 
-Lumos Backup includes an automatic GitHub update checker (`includes/class-updater.php`).
+Lumos Backup includes an automatic GitHub update checker (`includes/lumos-updater.php`, shared by all Lumos plugins).
+
+To ship an update, bump `Version:` and `LUMOS_BACKUP_VERSION` in `lumos-backup.php` and push to `main`. The workflow in `.github/workflows/release.yml` publishes release `v<version>` with the zip; pushes that keep the same version publish nothing.
 
 ```mermaid
 sequenceDiagram
@@ -48,8 +50,8 @@ sequenceDiagram
     participant WP as WordPress Website
     participant Admin as Site Administrator
 
-    Developer->>GitHub: Push code & git tag (e.g. v1.2.0)
-    GitHub->>GitHub: GitHub Action builds lumos-backup-v1.2.0.zip
+    Developer->>GitHub: Push to main with Version bumped to 1.2.0
+    GitHub->>GitHub: GitHub Action builds lumos-backup-v1.2.0.zip and publishes release v1.2.0
     WP->>GitHub: Periodic check to GitHub Releases API
     GitHub-->>WP: Returns latest version v1.2.0 + zip URL
     WP->>Admin: Shows "Update Available: Lumos Backup 1.2.0"
